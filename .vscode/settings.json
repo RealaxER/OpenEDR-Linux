@@ -1,0 +1,27 @@
+{
+    "files.associations": {
+        "uaccess.h": "c",
+        "module.h": "c",
+        "version.h": "c",
+        "device.h": "c",
+        "driver.h": "c",
+        "slab.h": "c",
+        "pid.h": "c",
+        "kprobes.h": "c",
+        "ftrace.h": "c",
+        "trace_recursion.h": "c",
+        "interrupt.h": "c",
+        "hardirq.h": "c",
+        "sched.h": "c",
+        "types.h": "c",
+        "namei.h": "c",
+        "netlink.h": "c",
+        "stdint.h": "c",
+        "internet": "c",
+        "typeinfo": "c",
+        "sock.h": "c",
+        "kthread.h": "c",
+        "wait.h": "c",
+        "list.h": "c"
+    }
+}

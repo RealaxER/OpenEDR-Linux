@@ -1,0 +1,1 @@
+cmd_/home/bhien/edr/edr_module.ko := ld -r  -m elf_x86_64 -z noexecstack   --build-id=sha1  -T scripts/module.lds -o /home/bhien/edr/edr_module.ko /home/bhien/edr/edr_module.o /home/bhien/edr/edr_module.mod.o;  true
