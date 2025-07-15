@@ -29,6 +29,7 @@
 #include "edr_module.h"
 #include "netlink.h"
 
+#define ASSERT_PID(x) current->pid == x
 
 struct ftrace_hook {
     const char *name;
@@ -39,19 +40,35 @@ struct ftrace_hook {
     struct ftrace_ops ops;
 };
 
-struct edr_event_queue {
-    struct list_head list;
-    struct edr_event event;  // dữ liệu bạn đã tạo
+
+#define EDR_RING_SIZE 512
+
+#ifdef EDR_QUEUE_RING_BUFFER 
+struct edr_ring_buffer {
+    struct edr_event buffer[EDR_RING_SIZE];
+    unsigned int head;
+    unsigned int tail;
+    spinlock_t lock;
+    wait_queue_head_t wq;
 };
+static struct edr_ring_buffer edr_rb;
+
+#endif
 
 static struct sock *nl_sk = NULL;
 static u32 pid_recv = 0;
+static struct task_struct *edr_thread;
 
+#ifdef EDR_QUEUE_LIST
+struct edr_event_queue {
+    struct list_head list;
+    struct edr_event event;  
+};
 static LIST_HEAD(edr_event_list);
 static DEFINE_MUTEX(edr_event_lock);
 static DECLARE_WAIT_QUEUE_HEAD(edr_event_wq);
-static struct task_struct *edr_thread;
 static atomic_t edr_has_event = ATOMIC_INIT(0);
+#endif
 
 static int module_unloading;
 
@@ -173,7 +190,8 @@ static void send_edr_event(struct edr_event *sample, int user_pid, int flags)
 }
 
 
-void edr_queue_event(struct edr_event *sample)
+#ifdef EDR_QUEUE_LIST
+void edr_queue_event_ll(struct edr_event *sample)
 {
     struct edr_event_queue *item = kmalloc(sizeof(*item), GFP_KERNEL);
     if (!item) return;
@@ -188,36 +206,114 @@ void edr_queue_event(struct edr_event *sample)
     wake_up_interruptible(&edr_event_wq);
 }
 
-static int edr_worker_thread(void *data)
+static int edr_worker_thread_ll(void *data)
 {
     while (!kthread_should_stop()) {
         wait_event_interruptible(edr_event_wq,
                                  atomic_read(&edr_has_event) ||
                                  kthread_should_stop());
-
-        while (1) {
-            struct edr_event_queue *item = NULL;
-
-            mutex_lock(&edr_event_lock);
-            if (list_empty(&edr_event_list)) {
-                atomic_set(&edr_has_event, 0);
-                mutex_unlock(&edr_event_lock);
-                break;
-            }
-
-            item = list_first_entry(&edr_event_list, struct edr_event_queue , list);
-            list_del(&item->list);
-            mutex_unlock(&edr_event_lock);
-
-            send_edr_event(&item->event, pid_recv, 0); 
+        struct edr_event_queue *item = NULL;
         
-            kfree(item->event.fname);
-            kfree(item->event.path);
-            kfree(item);         
+        mutex_lock(&edr_event_lock);
+        if (list_empty(&edr_event_list)) {
+            atomic_set(&edr_has_event, 0);
+            mutex_unlock(&edr_event_lock);
+            continue;
         }
+
+        item = list_first_entry(&edr_event_list, struct edr_event_queue , list);
+        list_del(&item->list);
+        mutex_unlock(&edr_event_lock);
+
+        send_edr_event(&item->event, pid_recv, 0); 
+    
+        kfree(item->event.fname);
+        kfree(item->event.path);
+        kfree(item);         
     }
+
+    pr_info("EDR thread exiting cleanly.\n");
     return 0;
 }
+#endif
+
+
+#ifdef EDR_QUEUE_RING_BUFFER
+void edr_queue_event_rb(struct edr_event *sample)
+{
+    struct edr_event ev_local;
+    unsigned long flags;
+    int next;
+
+    spin_lock_irqsave(&edr_rb.lock, flags);
+
+    next = (edr_rb.head + 1) % EDR_RING_SIZE;
+    if (next == edr_rb.tail) {
+        spin_unlock_irqrestore(&edr_rb.lock, flags);
+        return;
+    }
+
+    memset(&ev_local, 0, sizeof(ev_local));
+    ev_local = *sample;
+
+    if (sample->fname)
+        ev_local.fname = kstrdup(sample->fname, GFP_ATOMIC);
+    if (sample->path)
+        ev_local.path = kstrdup(sample->path, GFP_ATOMIC);
+
+    edr_rb.buffer[edr_rb.head] = ev_local;
+    edr_rb.head = next;
+
+    spin_unlock_irqrestore(&edr_rb.lock, flags);
+    wake_up_interruptible(&edr_rb.wq);
+}
+
+#define EDR_THREAD_TIMEOUT (HZ) // 1 seccond
+static int edr_worker_thread_rb(void *data)
+{
+    while (!kthread_should_stop()) {
+        struct edr_event ev;
+        unsigned long flags;
+        wait_event_interruptible_timeout(edr_rb.wq,
+            edr_rb.head != edr_rb.tail || kthread_should_stop(),
+            EDR_THREAD_TIMEOUT);
+        
+        spin_lock_irqsave(&edr_rb.lock, flags);
+
+        if (edr_rb.head == edr_rb.tail) {
+            spin_unlock_irqrestore(&edr_rb.lock, flags);
+            continue;
+        }
+        
+        ev = edr_rb.buffer[edr_rb.tail];
+        edr_rb.tail = (edr_rb.tail + 1) % EDR_RING_SIZE;
+        spin_unlock_irqrestore(&edr_rb.lock, flags);
+
+        send_edr_event(&ev, pid_recv, MSG_DONTWAIT);
+
+        if (ev.fname)
+            kfree(ev.fname);
+        if (ev.path)
+            kfree(ev.path);
+
+    }
+
+    pr_info("EDR thread exiting cleanly.\n");
+    return 0;
+}
+
+#endif
+
+#ifdef EDR_QUEUE_RING_BUFFER
+    #define EDR_QUEUE_EVENT(ev) \
+        do { edr_queue_event_rb(ev); } while (0)
+#elif defined(EDR_QUEUE_LIST)
+    #define EDR_QUEUE_EVENT(ev) \
+        do { edr_queue_event_ll(ev); } while (0)
+#else
+    #error "You must define either EDR_QUEUE_RING_BUFFER or EDR_QUEUE_LIST"
+#endif
+
 
 static void netlink_recv(struct sk_buff *skb)
 {
@@ -233,7 +329,13 @@ static void netlink_recv(struct sk_buff *skb)
         pid_recv = nlh->nlmsg_pid;
 
         if (!edr_thread) {
-            edr_thread = kthread_run(edr_worker_thread, NULL, "edr_sender");
+#ifdef EDR_QUEUE_RING_BUFFER
+    edr_thread = kthread_run(edr_worker_thread_rb, NULL, "edr_sender");
+#elif defined(EDR_QUEUE_LIST)
+    edr_thread = kthread_run(edr_worker_thread_ll, NULL, "edr_sender");
+#else
+    #error "You must define either EDR_QUEUE_RING_BUFFER or EDR_QUEUE_LIST"
+#endif
             if (IS_ERR(edr_thread)) {
                 pr_err("Failed to create worker thread: %ld\n", PTR_ERR(edr_thread));
                 edr_thread = NULL;
@@ -246,7 +348,7 @@ static void netlink_recv(struct sk_buff *skb)
 
     } else if (strncmp(msg->cmd, "stop", 4) == 0) {
         if (edr_thread) {
-            wake_up_interruptible(&edr_event_wq);
+            wake_up_interruptible(&edr_rb.wq);
             kthread_stop(edr_thread);
             edr_thread = NULL;
             pr_info("EDR worker thread stopped by PID %d\n", pid_recv);
@@ -259,18 +361,48 @@ static void netlink_recv(struct sk_buff *skb)
     }
 }
 
+char *get_path_fsf(struct path *ppath)
+{
+    char *page_buf, *path, *out;
+    size_t len;
+
+    page_buf = (char *)__get_free_page(GFP_KERNEL);
+    if (!page_buf)
+        return NULL;
+
+    path = d_path(ppath, page_buf, PAGE_SIZE);
+    if (IS_ERR(path)) {
+        free_page((unsigned long)page_buf);
+        return NULL;
+    }
+
+    len = strlen(path) + 1;
+
+    out = kmalloc(len, GFP_KERNEL);
+    if (!out) {
+        free_page((unsigned long)page_buf);
+        return NULL;
+    }
+    memcpy(out, path, len);
+    free_page((unsigned long)page_buf);
+
+    return out;
+}
 
 static asmlinkage long file_hooked_open(int dfd, const char __user *filename, int flags, umode_t mode)
 {
     struct path path;
     struct edr_event event;
     char * path_buffer;
-    char * path_str = NULL;
     int error;
 
     memset(&event, 0, sizeof(struct edr_event));
 
-    setup_event(event, "open");
+    setup_event(event, "file_open");
+
+    if(ASSERT_PID(pid_recv)) {
+        goto out;
+    }
 
     if (!filename) {
         goto out;
@@ -287,8 +419,8 @@ static asmlinkage long file_hooked_open(int dfd, const char __user *filename, in
         goto out;
     }
 
-    path_str = d_path(&path, path_buffer, PATH_MAX);
-    if (IS_ERR(path_str)) {
+    event.path = d_path(&path, path_buffer, PATH_MAX);
+    if (IS_ERR(event.path)) {
         kfree(path_buffer);
         path_put(&path);
         goto out;
@@ -302,20 +434,7 @@ static asmlinkage long file_hooked_open(int dfd, const char __user *filename, in
         goto out;
     }
 
-    
-    event.path = kstrdup(path_str, GFP_KERNEL);
-    if (!event.fname) {
-        pr_err("Failed to allocate memory for event.fname\n");
-        kfree(path_buffer);
-        kfree(event.fname);
-        path_put(&path);
-        goto out;
-    }
-
-    edr_queue_event(&event);
-    
-    if (path_buffer)
-        kfree(path_buffer);
+    EDR_QUEUE_EVENT(&event);
 
     if (path.dentry)
         path_put(&path);
@@ -326,30 +445,97 @@ out:
 
 
 static asmlinkage ssize_t file_hooked_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
-    if(file->f_path.dentry->d_name.name){
-        if (strstr(file->f_path.dentry->d_name.name, "f_read.txt") != NULL) {
-            pr_info ("FILE BLOCKED %s (pid=%d, tgid=%d) tried to read %s\n",
-            current->comm, current->pid, current->tgid, file->f_path.dentry->d_name.name);
-                return -EPERM; 
-        }
+    struct edr_event event;
+
+    memset(&event, 0, sizeof(struct edr_event));
+
+    if(ASSERT_PID(pid_recv)) {
+        goto out;
     }
+
+    setup_event(event, "file_read");
+
+    if(file) {
+        event.path = get_path_fsf(&file->f_path);
+
+        event.fname = kstrdup(file->f_path.dentry->d_name.name, GFP_KERNEL);
+        if (!event.fname) {
+            pr_err("Failed to allocate memory for event.fname\n");
+            if (event.path)
+                kfree(event.path);
+        }
+
+        EDR_QUEUE_EVENT(&event);
+    }
+
+out:
     return file_original_read(file, buf, count, pos);
 }
 
 static asmlinkage ssize_t file_hooked_write(struct file *file, char __user *buf, size_t count, loff_t *pos) {
-    if(file->f_path.dentry->d_name.name){
-        if (strstr(file->f_path.dentry->d_name.name, "f_write.txt") != NULL) {
-            pr_info ("FILE BLOCKED %s (pid=%d, tgid=%d) tried to write %s\n",
-            current->comm, current->pid, current->tgid, file->f_path.dentry->d_name.name);
-                return -EPERM; 
-        }
+    struct edr_event event;
+    
+    memset(&event, 0, sizeof(struct edr_event));
+
+    if(ASSERT_PID(pid_recv)) {
+        goto out;
     }
+    setup_event(event, "file_write");
+
+    if(file) {
+        event.path = get_path_fsf(&file->f_path);
+
+        event.fname = kstrdup(file->f_path.dentry->d_name.name, GFP_KERNEL);
+        if (!event.fname) {
+            pr_err("Failed to allocate memory for event.fname\n");
+            if (event.path)
+                kfree(event.path);
+        }
+
+        EDR_QUEUE_EVENT(&event);
+    }
+out:
     return file_original_write(file, buf, count, pos);
 }
 
 static asmlinkage int file_hooked_unlink(struct user_namespace *mnt_userns, struct inode *dir,
 	       struct dentry *dentry, struct inode **delegated_inode) {
 
+    char *path_buffer = NULL;
+    char *path_str = NULL;
+    const char *file_name;
+    struct edr_event event;
+    
+    memset(&event, 0, sizeof(struct edr_event));
+    setup_event(event, "unlink");
+
+    file_name = dentry->d_name.name;
+
+    path_buffer = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!path_buffer) {
+        goto out;
+    }
+
+    event.path = dentry_path_raw(dentry, path_buffer, PATH_MAX);
+
+    if (IS_ERR(path_str)) {
+        kfree(path_buffer);
+        pr_err("Failed to copy memory for path in unlink\n");
+        goto out;
+    }
+
+    if(dentry) {
+        event.fname = kstrdup(dentry->d_name.name, GFP_KERNEL);
+        if (!event.fname) {
+            pr_err("Failed to allocate memory for event.fname\n");
+            if (event.path)
+                kfree(event.path);
+        }
+
+        EDR_QUEUE_EVENT(&event);
+    }
+
+out:
     return file_original_unlink(mnt_userns, dir, dentry, delegated_inode);
 }
 
@@ -489,6 +675,10 @@ static int __init ftrace_hook_init(void){
     unsigned long flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
     size_t i;
     ret = get_func_kallsyms_lookup_name();
+
+#ifdef EDR_QUEUE_RING_BUFFER 
+    init_waitqueue_head(&edr_rb.wq);
+#endif
 
     nl_sk = netlink_kernel_create(&init_net, NETLINK_EDR, &cfg);
     if (!nl_sk) {

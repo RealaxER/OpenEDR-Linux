@@ -1,6 +1,10 @@
 #ifndef __EDR_PROBE_H__
 #define __EDR_PROBE_H__
 
+/*config*/
+
+
+#define EDR_QUEUE_RING_BUFFER 1
 
 static inline void syscall_get_arguments(struct task_struct *task,
 					 struct pt_regs *regs,

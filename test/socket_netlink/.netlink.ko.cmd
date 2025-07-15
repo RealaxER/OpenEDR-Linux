@@ -1,1 +1,0 @@
-cmd_/home/bhien/edr/test/socket_netlink/netlink.ko := ld -r  -m elf_x86_64 -z noexecstack   --build-id=sha1  -T scripts/module.lds -o /home/bhien/edr/test/socket_netlink/netlink.ko /home/bhien/edr/test/socket_netlink/netlink.o /home/bhien/edr/test/socket_netlink/netlink.mod.o;  true

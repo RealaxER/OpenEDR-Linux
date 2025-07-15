@@ -1,1 +1,0 @@
-cmd_/home/bhien/edr/test/socket_netlink/Module.symvers := sed 's/\.ko$$/\.o/' /home/bhien/edr/test/socket_netlink/modules.order | scripts/mod/modpost -m -a  -o /home/bhien/edr/test/socket_netlink/Module.symvers -e -i Module.symvers   -T -

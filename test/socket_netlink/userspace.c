@@ -6,13 +6,52 @@
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <stdint.h>
+#include <time.h>
+
 #include "netlink.h"
 
 #define NETLINK_EDR 29
 #define MAX_PAYLOAD 1024
+#define LOG_FILE_PATH "edr_log.txt"
+#define MAX_COMM_TRACKED 1024
 
 int sock_fd;
 struct sockaddr_nl dest_addr;
+FILE *log_file = NULL;
+
+// Track list of seen comms
+char *seen_comms[MAX_COMM_TRACKED];
+int seen_comm_count = 0;
+
+int already_logged_comm(const char *comm) {
+    for (int i = 0; i < seen_comm_count; i++) {
+        if (strcmp(seen_comms[i], comm) == 0) {
+            return 1; // already exists
+        }
+    }
+    return 0;
+}
+
+void add_logged_comm(const char *comm) {
+    if (seen_comm_count >= MAX_COMM_TRACKED) return;
+
+    seen_comms[seen_comm_count++] = strdup(comm);  // Remember to free if needed
+}
+
+const char *common_comms[] = {
+    "bash", "node", "sh", "which", "ps", "git", "sed", "cat", "sleep",
+    "systemd-journal", "auditd", "sshd", "in:imklog", "rs:main Q:Reg",
+    "gmain", "tokio-runtime-w", "dmesg", "irqbalance", "rtkit-daemon"
+};
+
+int is_common_comm(const char *comm) {
+    int n = sizeof(common_comms) / sizeof(common_comms[0]);
+    for (int i = 0; i < n; i++) {
+        if (strcmp(comm, common_comms[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
 
 void send_cmd_to_kernel(const char *cmd) {
     struct nlmsghdr *nlh;
@@ -48,8 +87,46 @@ void send_cmd_to_kernel(const char *cmd) {
 void handle_sigint(int sig) {
     printf("\nCaught SIGINT. Sending stop to kernel...\n");
     send_cmd_to_kernel("stop");
+
+    if (log_file) {
+        fclose(log_file);
+    }
+
+    for (int i = 0; i < seen_comm_count; i++) {
+        free(seen_comms[i]);
+    }
+
     close(sock_fd);
     exit(0);
+}
+
+void log_event_to_file(struct edr_event_hdr *hdr, const char *filename, const char *path) {
+    if (!log_file) return;
+
+    // if (already_logged_comm(hdr->comm)) {
+    //     return;
+    // }
+
+    // // Save this comm to prevent re-logging
+    // add_logged_comm(hdr->comm);
+
+    if (is_common_comm(hdr->comm)) return; // BỎ QUA tiến trình phổ biến
+
+
+    // Get current time
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char timestr[64];
+    strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    fprintf(log_file,
+        "[%s] [%s] pid=%d, tgid=%d, ppid=%d, uid=%d, comm=%s\n"
+        "         fname=%s, path=%s, flags=0x%x, result=%ld, timestamp=%ld\n\n",
+        timestr,
+        hdr->event, hdr->pid, hdr->tgid, hdr->ppid, hdr->uid, hdr->comm,
+        filename, path, hdr->flags, hdr->result, hdr->timestamp_ns);
+
+    fflush(log_file);  // Ghi ngay lập tức
 }
 
 int main() {
@@ -57,6 +134,12 @@ int main() {
     char buffer[MAX_PAYLOAD + NLMSG_HDRLEN];
 
     signal(SIGINT, handle_sigint);
+
+    log_file = fopen(LOG_FILE_PATH, "a");
+    if (!log_file) {
+        perror("Failed to open log file");
+        return 1;
+    }
 
     sock_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_EDR);
     if (sock_fd < 0) {
@@ -87,18 +170,7 @@ int main() {
         char *filename = ((char *)hdr) + hdr->fname_offset;
         char *path = ((char *)hdr) + hdr->path_offset;
 
-        printf("\n[EDR EVENT]\n");
-        printf("  %-10s: %s\n", "Event", hdr->event);
-        printf("  %-10s: %d\n", "PID", hdr->pid);
-        printf("  %-10s: %d\n", "PPID", hdr->ppid);
-        printf("  %-10s: %d\n", "TGID", hdr->tgid);
-        printf("  %-10s: %d\n", "UID", hdr->uid);
-        printf("  %-10s: %s\n", "Comm", hdr->comm);
-        printf("  %-10s: 0x%x\n", "Flags", hdr->flags);
-        printf("  %-10s: %ld\n", "Result", hdr->result);
-        printf("  %-10s: %ld\n", "Time(ns)", hdr->timestamp_ns);
-        printf("  %-10s: %s\n", "Filename", filename);
-        printf("  %-10s: %s\n", "Path", path);
+        log_event_to_file(hdr, filename, path);
     }
 
     return 0;
