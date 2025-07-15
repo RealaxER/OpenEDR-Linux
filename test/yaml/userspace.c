@@ -2,12 +2,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <yaml.h>
+#include <stdbool.h>
+#include <string.h>
+#include <ctype.h>
 
-#define MAX_RULES 16
+#define COMMAND_NONE -1
+#define COMMAND_AND   0
+#define COMMAND_OR    1
+
+#define OPERATOR_EQUALS 0
+#define OPERATOR_IN     1
+
+#define MAX_FIELD_SIZE  64
+#define MAX_VALUE_SIZE  64
+
+struct command {
+    int flag;                 // AND / OR / NONE
+    int operator;             // == / in
+    char field[MAX_FIELD_SIZE]; 
+    char value[MAX_VALUE_SIZE]; 
+};
+
+#define MAX_RULES 100
 #define MAX_HOOKS 10
 #define MAX_TAGS 10
 #define MAX_STRING_LEN 256
-#define MAX_LONG_STRING_LEN 2048
+#define MAX_LONG_STRING_LEN 1024
 
 typedef struct {
     char name[MAX_STRING_LEN];
@@ -66,8 +86,68 @@ void process_scalar(yaml_token_t token) {
     }
 }
 
+int parse_conditions(const char *input_str, struct command *cmds, int max_cmds) {
+    char buffer[1024];
+    strncpy(buffer, input_str, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
 
-// --- HÀM MAIN ---
+    char *tokens[256];
+    int token_count = 0;
+
+    // Tách từng token
+    char *token = strtok(buffer, " ");
+    while (token && token_count < 256) {
+        tokens[token_count++] = token;
+        token = strtok(NULL, " ");
+    }
+
+    int i = 0, cmd_count = 0;
+    int current_flag = COMMAND_NONE;
+
+    while (i < token_count - 2 && cmd_count < max_cmds) {
+        char *field = tokens[i];
+        char *op = tokens[i + 1];
+        char *val = tokens[i + 2];
+
+        struct command *c = &cmds[cmd_count];
+        c->flag = current_flag;
+
+        // Gán field và value
+        strncpy(c->field, field, MAX_FIELD_SIZE - 1);
+        c->field[MAX_FIELD_SIZE - 1] = '\0';
+
+        strncpy(c->value, val, MAX_VALUE_SIZE - 1);
+        c->value[MAX_VALUE_SIZE - 1] = '\0';
+
+        // Gán toán tử
+        if (strcmp(op, "==") == 0) {
+            c->operator = OPERATOR_EQUALS;
+        } else if (strcmp(op, "in") == 0) {
+            c->operator = OPERATOR_IN;
+        } else {
+            fprintf(stderr, "Unknown operator: %s\n", op);
+            return -1;
+        }
+
+        cmd_count++;
+        i += 3;
+
+        if (i < token_count) {
+            if (strcmp(tokens[i], "and") == 0) {
+                current_flag = COMMAND_AND;
+            } else if (strcmp(tokens[i], "or") == 0) {
+                current_flag = COMMAND_OR;
+            } else {
+                current_flag = COMMAND_NONE;
+            }
+            i++;
+        }
+    }
+
+    return cmd_count;
+}
+
+
 int main() {
     FILE *fh = fopen("config.yaml", "r");
     if (!fh) {
@@ -114,12 +194,12 @@ int main() {
             process_scalar(token);
             break;
 
-        case YAML_FLOW_SEQUENCE_START_TOKEN: // '['
+        case YAML_FLOW_SEQUENCE_START_TOKEN: 
             if (strcmp(current_key, "hooked") == 0) parsing_hooked_array = 1;
             else if (strcmp(current_key, "tags") == 0) parsing_tags_array = 1;
             break;
         
-        case YAML_FLOW_SEQUENCE_END_TOKEN: // ']'
+        case YAML_FLOW_SEQUENCE_END_TOKEN:
             parsing_hooked_array = 0;
             parsing_tags_array = 0;
             break;
@@ -134,9 +214,8 @@ int main() {
     yaml_parser_delete(&parser);
     fclose(fh);
 
-    // --- IN KẾT QUẢ ĐÃ PARSE ---
     int total_rules = rule_count + 1;
-    if (rules[0].name[0] == '\0') total_rules = 0; // Xử lý trường hợp file rỗng
+    if (rules[0].name[0] == '\0') total_rules = 0; 
 
     printf("--- PARSED %d RULES ---\n\n", total_rules);
     for (int i = 0; i < total_rules; i++) {
@@ -149,6 +228,22 @@ int main() {
         printf("  priority: %s\n", rules[i].priority);
         printf("  output: %s\n", rules[i].output);
         printf("  condition: %s\n", rules[i].condition);
+
+        struct command cmds[10];
+
+        int n = parse_conditions(rules[i].condition, cmds, 10);
+
+        for (int i = 0; i < n; ++i) {
+            printf("Command %d:\n", i);
+            printf("  flag     : %s\n",
+                cmds[i].flag == COMMAND_AND ? "AND" :
+                cmds[i].flag == COMMAND_OR  ? "OR" : "NONE");
+            printf("  field    : %s\n", cmds[i].field);
+            printf("  operator : %s\n", cmds[i].operator == OPERATOR_EQUALS ? "==" : "in");
+            printf("  value    : %s\n", cmds[i].value);
+            printf("\n");
+        }
+
         
         printf("  hooked: [");
         for (int j = 0; j < rules[i].hooked_count; j++) {
@@ -160,6 +255,7 @@ int main() {
         for (int j = 0; j < rules[i].tags_count; j++) {
             printf("%s%s", rules[i].tags[j], (j == rules[i].tags_count - 1) ? "" : ", ");
         }
+
         printf("]\n\n");
     }
 
