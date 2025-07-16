@@ -7,8 +7,9 @@
 #include <linux/netlink.h>
 #include <stdint.h>
 #include <time.h>
-
-#include "netlink.h"
+#include <yaml.h>
+#include <stdbool.h>
+#include "../../netlink.h"
 
 #define NETLINK_EDR 29
 #define MAX_PAYLOAD 1024
@@ -18,6 +19,130 @@
 int sock_fd;
 struct sockaddr_nl dest_addr;
 FILE *log_file = NULL;
+
+
+#define MAX_RULES 100
+#define MAX_HOOKS 10
+#define MAX_TAGS 10
+#define MAX_STRING_LEN 256
+#define MAX_LONG_STRING_LEN 1024
+
+typedef struct {
+    char name[MAX_STRING_LEN];
+    char id[TASK_COMM_LEN];
+    
+    char description[1024];
+    char path[1024];
+    char fname[MAX_STRING_LEN];
+    char action[TASK_COMM_LEN];
+    char priority[TASK_COMM_LEN];
+    char output[1024];
+    char condition[MAX_LONG_STRING_LEN];
+    
+    char hooked[MAX_HOOKS][TASK_COMM_LEN];
+    int hooked_count;
+    
+    char tags[MAX_TAGS][TASK_COMM_LEN];
+    int tags_count;
+} edr_rule_t;
+
+edr_rule_t rules[MAX_RULES];
+int rule_count = 0;
+
+char current_key[128] = {0};
+int expect_value = 0;
+int parsing_hooked_array = 0;
+int parsing_tags_array = 0;
+
+void process_scalar(yaml_token_t token) {
+    edr_rule_t *current_rule = &rules[rule_count];
+
+    if (parsing_hooked_array) {
+        if (current_rule->hooked_count < MAX_HOOKS) {
+            strncpy(current_rule->hooked[current_rule->hooked_count++], (char*)token.data.scalar.value, 64 - 1);
+        }
+        return;
+    }
+    if (parsing_tags_array) {
+        if (current_rule->tags_count < MAX_TAGS) {
+            strncpy(current_rule->tags[current_rule->tags_count++], (char*)token.data.scalar.value, 64 - 1);
+        }
+        return;
+    }
+
+    if (!expect_value) { 
+        strncpy(current_key, (char *)token.data.scalar.value, sizeof(current_key) - 1);
+    } else {
+        if (strcmp(current_key, "rule") == 0) strncpy(current_rule->name, (char*)token.data.scalar.value, sizeof(current_rule->name) - 1);
+        else if (strcmp(current_key, "id") == 0) strncpy(current_rule->id, (char*)token.data.scalar.value, sizeof(current_rule->id) - 1);
+        else if (strcmp(current_key, "des") == 0) strncpy(current_rule->description, (char*)token.data.scalar.value, sizeof(current_rule->description) - 1);
+        else if (strcmp(current_key, "path") == 0) strncpy(current_rule->path, (char*)token.data.scalar.value, sizeof(current_rule->path) - 1);
+        else if (strcmp(current_key, "fname") == 0) strncpy(current_rule->fname, (char*)token.data.scalar.value, sizeof(current_rule->fname) - 1);
+        else if (strcmp(current_key, "action") == 0) strncpy(current_rule->action, (char*)token.data.scalar.value, sizeof(current_rule->action) - 1);
+        else if (strcmp(current_key, "priority") == 0) strncpy(current_rule->priority, (char*)token.data.scalar.value, sizeof(current_rule->priority) - 1);
+        else if (strcmp(current_key, "output") == 0) strncpy(current_rule->output, (char*)token.data.scalar.value, sizeof(current_rule->output) - 1);
+        else if (strcmp(current_key, "condition") == 0) strncpy(current_rule->condition, (char*)token.data.scalar.value, sizeof(current_rule->condition) - 1);
+    }
+}
+
+int parse_conditions(const char *input_str, struct command *cmds, int max_cmds) {
+    char buffer[1024];
+    strncpy(buffer, input_str, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+
+    char *tokens[256];
+    int token_count = 0;
+
+    char *token = strtok(buffer, " ");
+    while (token && token_count < 256) {
+        tokens[token_count++] = token;
+        token = strtok(NULL, " ");
+    }
+
+    int i = 0, cmd_count = 0;
+    int current_flag = COMMAND_NONE;
+
+    while (i < token_count - 2 && cmd_count < max_cmds) {
+        char *field = tokens[i];
+        char *op = tokens[i + 1];
+        char *val = tokens[i + 2];
+
+        struct command *c = &cmds[cmd_count];
+        c->flag = current_flag;
+
+        strncpy(c->field, field, MAX_FIELD_SIZE - 1);
+        c->field[MAX_FIELD_SIZE - 1] = '\0';
+
+        strncpy(c->value, val, MAX_VALUE_SIZE - 1);
+        c->value[MAX_VALUE_SIZE - 1] = '\0';
+
+        if (strcmp(op, "==") == 0) {
+            c->operator = OPERATOR_EQUALS;
+        } else if (strcmp(op, "in") == 0) {
+            c->operator = OPERATOR_IN;
+        } else {
+            fprintf(stderr, "Unknown operator: %s\n", op);
+            return -1;
+        }
+
+        cmd_count++;
+        i += 3;
+
+        if (i < token_count) {
+            if (strcmp(tokens[i], "and") == 0) {
+                current_flag = COMMAND_AND;
+            } else if (strcmp(tokens[i], "or") == 0) {
+                current_flag = COMMAND_OR;
+            } else {
+                current_flag = COMMAND_NONE;
+            }
+            i++;
+        }
+    }
+
+    return cmd_count;
+}
+
 
 // Track list of seen comms
 char *seen_comms[MAX_COMM_TRACKED];
@@ -53,27 +178,31 @@ int is_common_comm(const char *comm) {
     return 0;
 }
 
-void send_cmd_to_kernel(const char *cmd) {
+void send_edr_event_cmd_to_kernel(struct edr_event_cmd *cmd, const char *fname, const char *path) {
     struct nlmsghdr *nlh;
-    struct edr_netlink_cmd payload;
-
     struct iovec iov;
     struct msghdr msg;
     memset(&msg, 0, sizeof(msg));
-    memset(&payload, 0, sizeof(payload));
 
-    strncpy(payload.cmd, cmd, sizeof(payload.cmd) - 1);
-    payload.pid = getpid();
+    size_t fname_len = strlen(fname) + 1;
+    size_t path_len  = strlen(path) + 1;
 
-    nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(sizeof(payload)));
-    memset(nlh, 0, NLMSG_SPACE(sizeof(payload)));
-    nlh->nlmsg_len = NLMSG_SPACE(sizeof(payload));
+    cmd->fname_offset = sizeof(struct edr_event_cmd);
+    cmd->path_offset  = cmd->fname_offset + fname_len;
+    cmd->total_size   = cmd->path_offset + path_len;
+
+    nlh = malloc(NLMSG_SPACE(cmd->total_size));
+    memset(nlh, 0, NLMSG_SPACE(cmd->total_size));
+    nlh->nlmsg_len = NLMSG_SPACE(cmd->total_size);
     nlh->nlmsg_pid = getpid();
     nlh->nlmsg_flags = 0;
 
-    memcpy(NLMSG_DATA(nlh), &payload, sizeof(payload));
+    void *payload = NLMSG_DATA(nlh);
+    memcpy(payload, cmd, sizeof(struct edr_event_cmd));
+    memcpy((char *)payload + cmd->fname_offset, fname, fname_len);
+    memcpy((char *)payload + cmd->path_offset, path, path_len);
 
-    iov.iov_base = (void *)nlh;
+    iov.iov_base = nlh;
     iov.iov_len = nlh->nlmsg_len;
     msg.msg_name = (void *)&dest_addr;
     msg.msg_namelen = sizeof(dest_addr);
@@ -84,13 +213,41 @@ void send_cmd_to_kernel(const char *cmd) {
     free(nlh);
 }
 
+void send_cmd_to_kernel_example(void){
+    struct edr_event_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+
+    // ID dùng để track hoặc cancel rule
+    strncpy(cmd.id, "rule_01", TASK_COMM_LEN);
+
+    // 1 rule: uid == 0
+    cmd.command[0].flag = COMMAND_NONE;
+    cmd.command[0].operator = OPERATOR_EQUALS;
+    strncpy(cmd.command[0].field, "uid", MAX_FIELD_SIZE);
+    strncpy(cmd.command[0].value, "0", MAX_VALUE_SIZE);
+
+    // 2 rule: comm in bash,zsh
+    cmd.command[1].flag = COMMAND_AND;
+    cmd.command[1].operator = OPERATOR_IN;
+    strncpy(cmd.command[1].field, "comm", MAX_FIELD_SIZE);
+    strncpy(cmd.command[1].value, "bash", MAX_VALUE_SIZE);
+
+    // Hooked hành vi
+    strncpy(cmd.hooked[0], "open", TASK_COMM_LEN);
+    strncpy(cmd.hooked[1], "read", TASK_COMM_LEN);
+    strncpy(cmd.hooked[2], "write", TASK_COMM_LEN);
+    strncpy(cmd.hooked[3], "unlink", TASK_COMM_LEN);
+
+    // Gửi xuống kernel
+    send_edr_event_cmd_to_kernel(&cmd, "shadow", "/etc/shadow");
+}
+
 void handle_sigint(int sig) {
     printf("\nCaught SIGINT. Sending stop to kernel...\n");
-    send_cmd_to_kernel("stop");
 
-    if (log_file) {
-        fclose(log_file);
-    }
+    // if (log_file) {
+    //     fclose(log_file);
+    // }
 
     for (int i = 0; i < seen_comm_count; i++) {
         free(seen_comms[i]);
@@ -110,7 +267,7 @@ void log_event_to_file(struct edr_event_hdr *hdr, const char *filename, const ch
     // // Save this comm to prevent re-logging
     // add_logged_comm(hdr->comm);
 
-    if (is_common_comm(hdr->comm)) return; // BỎ QUA tiến trình phổ biến
+    // if (is_common_comm(hdr->comm)) return; // BỎ QUA tiến trình phổ biến
 
 
     // Get current time
@@ -130,6 +287,73 @@ void log_event_to_file(struct edr_event_hdr *hdr, const char *filename, const ch
 }
 
 int main() {
+    FILE *fh = fopen("config.yaml", "r");
+    if (!fh) {
+        perror("fopen: config.yaml");
+        return 1;
+    }
+    yaml_parser_t parser;
+    yaml_token_t token;
+
+    yaml_parser_initialize(&parser);
+    yaml_parser_set_input_file(&parser, fh);
+
+    int done = 0;
+    while (!done) {
+        if (!yaml_parser_scan(&parser, &token)) {
+            fprintf(stderr, "Error parsing YAML\n");
+            break;
+        }
+
+        switch (token.type) {
+        case YAML_STREAM_END_TOKEN:
+            done = 1;
+            break;
+
+        case YAML_BLOCK_ENTRY_TOKEN: 
+            if (rules[rule_count].name[0] != '\0') { 
+                 if(rule_count < MAX_RULES -1) {
+                    rule_count++;
+                 }
+            }
+            rules[rule_count].hooked_count = 0;
+            rules[rule_count].tags_count = 0;
+            break;
+
+        case YAML_KEY_TOKEN:
+            expect_value = 0;
+            break;
+        case YAML_VALUE_TOKEN:
+            expect_value = 1;
+            break;
+
+        case YAML_SCALAR_TOKEN:
+            process_scalar(token);
+            break;
+
+        case YAML_FLOW_SEQUENCE_START_TOKEN: 
+            if (strcmp(current_key, "hooked") == 0) parsing_hooked_array = 1;
+            else if (strcmp(current_key, "tags") == 0) parsing_tags_array = 1;
+            break;
+        
+        case YAML_FLOW_SEQUENCE_END_TOKEN:
+            parsing_hooked_array = 0;
+            parsing_tags_array = 0;
+            break;
+
+        default:
+            break;
+        }
+
+        yaml_token_delete(&token);
+    }
+
+    yaml_parser_delete(&parser);
+    fclose(fh);
+
+    int total_rules = rule_count + 1;
+    if (rules[0].name[0] == '\0') total_rules = 0; 
+
     struct sockaddr_nl src_addr = {0};
     char buffer[MAX_PAYLOAD + NLMSG_HDRLEN];
 
@@ -156,7 +380,34 @@ int main() {
     dest_addr.nl_groups = 0;
 
     printf("Sending start to kernel...\n");
-    send_cmd_to_kernel("start");
+
+    struct edr_event_cmd event;
+    memset(&event, 0, sizeof(event));
+
+    event.flags = EDR_EVENT_SET;
+
+    printf("--- PARSED %d RULES ---\n\n", total_rules);
+    for (int i = 0; i < total_rules; i++) {
+        struct command cmds[MAX_COMMAND_RULE];
+
+        if(strstr(rules[i].action, "block")) {
+            event.action = EDR_ACTION_BLOCK;
+        }else {
+            event.action = EDR_ACTION_MONITOR;
+        }
+
+        int command_count = parse_conditions(rules[i].condition, cmds, MAX_COMMAND_RULE);
+
+        strncpy(event.id, rules[i].id, TASK_COMM_LEN);
+        event.id[TASK_COMM_LEN - 1] = '\0';
+        memcpy(event.command, cmds, sizeof(struct command) * command_count);
+
+        memcpy(event.hooked, rules[i].hooked, sizeof(char) * TASK_COMM_LEN * rules[i].hooked_count);
+        event.hooked_count = rules[i].hooked_count;
+        event.command_count = command_count;
+
+        send_edr_event_cmd_to_kernel(&event, rules[i].fname, rules[i].path);
+    }
 
     printf("Waiting for EDR events...\n");
 
@@ -170,7 +421,7 @@ int main() {
         char *filename = ((char *)hdr) + hdr->fname_offset;
         char *path = ((char *)hdr) + hdr->path_offset;
 
-        log_event_to_file(hdr, filename, path);
+        // log_event_to_file(hdr, filename, path);
     }
 
     return 0;

@@ -9,21 +9,6 @@
 
 #define NETLINK_EDR 29
 
-#define HOOK_OPEN_STR     "open"
-#define HOOK_READ_STR     "read"
-#define HOOK_WRITE_STR    "write"
-#define HOOK_UNLINK_STR   "unlink"
-
-#define HOOK_OPEN_INDEX 0
-#define HOOK_READ_INDEX 1
-#define HOOK_WRITE_INDEX 2
-#define HOOK_UNLINK_INDEX  3
-
-#define HOOK_OPEN_BIT     (1ULL << HOOK_OPEN_INDEX)
-#define HOOK_READ_BIT     (1ULL << HOOK_READ_INDEX)
-#define HOOK_WRITE_BIT    (1ULL << HOOK_WRITE_INDEX)
-#define HOOK_UNLINK_BIT   (1ULL << HOOK_UNLINK_INDEX)
-
 struct edr_event {
     char event[TASK_COMM_LEN];          
     pid_t pid;                          
@@ -40,6 +25,10 @@ struct edr_event {
     long timestamp_ns;       
 }__attribute__((packed));
 
+struct edr_netlink_cmd {
+    char cmd[TASK_COMM_LEN]; 
+    int pid;
+};
 
 #define setup_event(event, name) do { \
     (event).pid = current->pid; \
@@ -69,46 +58,6 @@ struct edr_event_hdr {
     long result;                        
     long timestamp_ns;                  
 
-    __u16 total_size;                   
-} __attribute__((packed));
-
-
-#define COMMAND_NONE -1
-#define COMMAND_AND   0
-#define COMMAND_OR    1
-
-#define OPERATOR_EQUALS 0
-#define OPERATOR_IN     1
-
-#define MAX_FIELD_SIZE  64
-#define MAX_VALUE_SIZE  64
-#define MAX_COMMAND_RULE 10
-
-struct command {
-    int flag;                 // AND / OR / NONE
-    int operator;             // == / in
-    char field[MAX_FIELD_SIZE]; 
-    char value[MAX_VALUE_SIZE]; 
-};
-
-#define EDR_EVENT_SET 0
-#define EDR_EVENT_CLEAR 1
-
-enum edr_action {
-    EDR_ACTION_MONITOR = 0,
-    EDR_ACTION_BLOCK   = 1
-};
-
-struct edr_event_cmd {
-    int flags;
-    char id[TASK_COMM_LEN];  
-    __u16 fname_offset;              
-    __u16 path_offset;         
-    struct command command[MAX_COMMAND_RULE];    
-    char hooked [MAX_COMMAND_RULE][TASK_COMM_LEN];
-    __u8 command_count;
-    __u8 hooked_count;
-    __u8 action; 
     __u16 total_size;                   
 } __attribute__((packed));
 

@@ -1,0 +1,28 @@
+- rule: Monitor /etc/shadow access
+  id: FIM-001
+  des: Monitor /etc/shadow when accessed by bash with pid 56 or by uid 100
+  path: /etc/shadow
+  fname: shadow
+  action: monitor
+  priority: CRITICAL
+  output: Access to /etc/shadow detected.
+  condition: comm == cat
+  
+  hooked: [open, write, read, unlink]
+  tags: [fim, linux, credentials]
+
+# - rule: Block Execution from /tmp
+#   id: BE-001
+#   des: Block any process execution from /tmp directory
+#   path: /tmp/
+#   fname: "*"
+#   action: block
+#   priority: HIGH
+#   output: Execution from /tmp blocked.
+#   condition: path in /tmp/ 
+#     and name == shadow 
+#     and uid == 100
+#     and pid == 10000
+#     or comm in bash
+#   hooked: [execve, execveat]
+#   tags: [process, hardening]

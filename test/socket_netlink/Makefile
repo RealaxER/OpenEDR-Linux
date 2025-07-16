@@ -1,2 +1,2 @@
 all:
-	gcc -o userspace userspace.c
+	gcc -o userspace userspace.c -lyaml

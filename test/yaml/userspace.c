@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <ctype.h>
+#include "netlink.h"
 
 #define COMMAND_NONE -1
 #define COMMAND_AND   0
@@ -94,7 +95,6 @@ int parse_conditions(const char *input_str, struct command *cmds, int max_cmds) 
     char *tokens[256];
     int token_count = 0;
 
-    // Tách từng token
     char *token = strtok(buffer, " ");
     while (token && token_count < 256) {
         tokens[token_count++] = token;
@@ -112,14 +112,12 @@ int parse_conditions(const char *input_str, struct command *cmds, int max_cmds) 
         struct command *c = &cmds[cmd_count];
         c->flag = current_flag;
 
-        // Gán field và value
         strncpy(c->field, field, MAX_FIELD_SIZE - 1);
         c->field[MAX_FIELD_SIZE - 1] = '\0';
 
         strncpy(c->value, val, MAX_VALUE_SIZE - 1);
         c->value[MAX_VALUE_SIZE - 1] = '\0';
 
-        // Gán toán tử
         if (strcmp(op, "==") == 0) {
             c->operator = OPERATOR_EQUALS;
         } else if (strcmp(op, "in") == 0) {
@@ -217,17 +215,22 @@ int main() {
     int total_rules = rule_count + 1;
     if (rules[0].name[0] == '\0') total_rules = 0; 
 
+    struct edr_event_hdr event;
+
     printf("--- PARSED %d RULES ---\n\n", total_rules);
     for (int i = 0; i < total_rules; i++) {
-        printf("- rule: %s\n", rules[i].name);
-        printf("  id: %s\n", rules[i].id);
-        printf("  des: %s\n", rules[i].description);
-        printf("  path: %s\n", rules[i].path);
-        printf("  fname: %s\n", rules[i].fname);
-        printf("  action: %s\n", rules[i].action);
-        printf("  priority: %s\n", rules[i].priority);
-        printf("  output: %s\n", rules[i].output);
-        printf("  condition: %s\n", rules[i].condition);
+        // printf("- rule: %s\n", rules[i].name);
+        // printf("  id: %s\n", rules[i].id);
+        // printf("  des: %s\n", rules[i].description);
+        // printf("  path: %s\n", rules[i].path);
+        // printf("  fname: %s\n", rules[i].fname);
+        // printf("  action: %s\n", rules[i].action);
+        // printf("  priority: %s\n", rules[i].priority);
+        // printf("  output: %s\n", rules[i].output);
+        // printf("  condition: %s\n", rules[i].condition);
+
+
+        event.name = 
 
         struct command cmds[10];
 
