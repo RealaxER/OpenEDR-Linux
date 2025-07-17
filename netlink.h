@@ -91,8 +91,9 @@ struct command {
     char value[MAX_VALUE_SIZE]; 
 };
 
-#define EDR_EVENT_SET 0
-#define EDR_EVENT_CLEAR 1
+#define EDR_EVENT_SET (1ULL << 0)
+#define EDR_EVENT_CLEAR (1ULL << 1)
+#define EDR_EVENT_CHECK_PATH (1ULL << 2)
 
 enum edr_action {
     EDR_ACTION_MONITOR = 0,

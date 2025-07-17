@@ -136,6 +136,10 @@ int parse_conditions(const char *input_str, struct command *cmds, int max_cmds) 
             } else {
                 current_flag = COMMAND_NONE;
             }
+
+            if(c->flag == COMMAND_NONE) {
+                c->flag = current_flag;
+            }
             i++;
         }
     }
@@ -176,6 +180,15 @@ int is_common_comm(const char *comm) {
             return 1;
     }
     return 0;
+}
+
+bool path_has_slash_star(const char *path) {
+    size_t len = strlen(path); 
+
+    if (len >= 2 && path[len - 2] == '/' && path[len - 1] == '*') {
+        return true;
+    }
+    return false;
 }
 
 void send_edr_event_cmd_to_kernel(struct edr_event_cmd *cmd, const char *fname, const char *path) {
@@ -286,6 +299,13 @@ void log_event_to_file(struct edr_event_hdr *hdr, const char *filename, const ch
     fflush(log_file);  // Ghi ngay lập tức
 }
 
+void remove_asterisk(char *path) {
+    char *slash_asterisk_pos = strstr(path, "/*"); 
+    if (slash_asterisk_pos != NULL) {
+        *slash_asterisk_pos = '\0'; 
+    }
+}
+
 int main() {
     FILE *fh = fopen("config.yaml", "r");
     if (!fh) {
@@ -384,6 +404,9 @@ int main() {
     struct edr_event_cmd event;
     memset(&event, 0, sizeof(event));
 
+    event.flags = EDR_EVENT_CLEAR;
+    send_edr_event_cmd_to_kernel(&event, "", "");
+
     event.flags = EDR_EVENT_SET;
 
     printf("--- PARSED %d RULES ---\n\n", total_rules);
@@ -405,6 +428,16 @@ int main() {
         memcpy(event.hooked, rules[i].hooked, sizeof(char) * TASK_COMM_LEN * rules[i].hooked_count);
         event.hooked_count = rules[i].hooked_count;
         event.command_count = command_count;
+
+        printf("path before: %s\n", rules[i].path);
+
+        if(path_has_slash_star(rules[i].path)) {
+            event.flags |= EDR_EVENT_CHECK_PATH;
+            remove_asterisk(rules[i].path);
+            printf("path after: %s\n", rules[i].path);
+        }else {
+            event.flags = EDR_EVENT_SET;
+        }
 
         send_edr_event_cmd_to_kernel(&event, rules[i].fname, rules[i].path);
     }

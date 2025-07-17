@@ -1,14 +1,29 @@
 - rule: Monitor /etc/shadow access
-  id: FIM-001
+  id: BDH-01
   des: Monitor /etc/shadow when accessed by bash with pid 56 or by uid 100
   path: /etc/shadow
   fname: shadow
   action: monitor
   priority: CRITICAL
   output: Access to /etc/shadow detected.
-  condition: comm == cat
+  condition: syscall == open 
+    or syscall == read 
+    or syscall == write
   
   hooked: [open, write, read, unlink]
+  tags: [fim, linux, credentials]
+
+
+- rule: Monitor unlink folder /home/bhien/edr/test/socket_netlink/
+  id: BDH-02
+  des: Monitor and hook to folder socket_netlink when unlink open
+  path: /home/bhien/edr/test/socket_netlink/*
+  fname:  
+  action: monitor
+  priority: CRITICAL
+  output: Access to f_unlink.txt detected.
+  condition: syscall == open or syscall == unlink
+  hooked: [open,unlink]
   tags: [fim, linux, credentials]
 
 # - rule: Block Execution from /tmp

@@ -43,18 +43,26 @@ struct ftrace_hook {
 typedef __u32 EDR_BIT;
 #define MAX_COMMAND_INDEX 32
 
-#define MAX_PATH_HOOK 32
-#define MAX_FNAME_HOOK 32
+#define MAX_INDEX_PATH_HOOK 32
+#define MAX_INDEX_FNAME_HOOK 32
 
+struct command_group {
+    struct command commands[MAX_COMMAND_RULE];
+    int command_count;
+};
 
 struct edr_rule {
     struct command commands[MAX_COMMAND_RULE];
+    struct command_group cmd_or;
+    struct command_group cmd_and;
+
     uint8_t command_count;
 
-    char *paths[MAX_PATH_HOOK];   
-    char *fnames[MAX_FNAME_HOOK]; 
+    char *paths[MAX_INDEX_PATH_HOOK];   
+    char *fnames[MAX_INDEX_FNAME_HOOK]; 
 
     enum edr_action action;       
+    uint8_t flag; 
 };
 
 struct edr_system {
@@ -75,6 +83,10 @@ static inline void edr_set_hook(struct edr_system *sys, EDR_BIT flag) {
 // Check if a hook flag is set
 static inline bool edr_is_hook(struct edr_system sys, EDR_BIT flag) {
     return (sys.hooked & flag) != 0;
+}
+
+static inline bool edr_is_flag(EDR_BIT bit, EDR_BIT flag) {
+    return (bit & flag) != 0;
 }
 
 static inline EDR_BIT edr_get_hook_bit(const char *hook_name) {
@@ -369,53 +381,6 @@ static int edr_worker_thread_rb(void *data)
     #error "You must define either EDR_QUEUE_RING_BUFFER or EDR_QUEUE_LIST"
 #endif
 
-
-// static void netlink_recv(struct sk_buff *skb)
-// {
-//     struct nlmsghdr *nlh;
-//     struct edr_netlink_cmd *msg;
-
-//     nlh = nlmsg_hdr(skb);
-//     msg = (struct edr_netlink_cmd *)nlmsg_data(nlh);
-
-//     pr_info("netlink command: %s for PID: %d\n", msg->cmd, msg->pid);
-
-//     if (strncmp(msg->cmd, "start", 5) == 0) {
-//         pid_recv = nlh->nlmsg_pid;
-
-//         if (!edr_thread) {
-// #ifdef EDR_QUEUE_RING_BUFFER
-//     edr_thread = kthread_run(edr_worker_thread_rb, NULL, "edr_sender");
-// #elif defined(EDR_QUEUE_LIST)
-//     edr_thread = kthread_run(edr_worker_thread_ll, NULL, "edr_sender");
-// #else
-//     #error "You must define either EDR_QUEUE_RING_BUFFER or EDR_QUEUE_LIST"
-// #endif
-//             if (IS_ERR(edr_thread)) {
-//                 pr_err("Failed to create worker thread: %ld\n", PTR_ERR(edr_thread));
-//                 edr_thread = NULL;
-//             } else {
-//                 pr_info("EDR worker thread started by PID %d\n", pid_recv);
-//             }
-//         } else {
-//             pr_info("EDR worker thread already running.\n");
-//         }
-
-//     } else if (strncmp(msg->cmd, "stop", 4) == 0) {
-//         if (edr_thread) {
-//             wake_up_interruptible(&edr_rb.wq);
-//             kthread_stop(edr_thread);
-//             edr_thread = NULL;
-//             pr_info("EDR worker thread stopped by PID %d\n", pid_recv);
-//         } else {
-//             pr_info("No running EDR thread to stop.\n");
-//         }
-
-//     } else {
-//         pr_warn("Unknown command received from user: %s\n", msg->cmd);
-//     }
-// }
-
 static void netlink_recv(struct sk_buff *skb)
 {
     struct nlmsghdr *nlh = nlmsg_hdr(skb);
@@ -424,7 +389,7 @@ static void netlink_recv(struct sk_buff *skb)
 
     struct edr_event_cmd *cmd = (struct edr_event_cmd *)data;
 
-    if (cmd->flags == EDR_EVENT_SET) {
+    if (edr_is_flag(cmd->flags, EDR_EVENT_SET)) {
         const char *fname = (char *)cmd + cmd->fname_offset;
         const char *path  = (char *)cmd + cmd->path_offset;
         int rule_idx; 
@@ -452,27 +417,37 @@ static void netlink_recv(struct sk_buff *skb)
 
             rule = &edr_module.rules[index][rule_idx];
             memset(rule, 0, sizeof(struct edr_rule));
-
+            
             rule->command_count = cmd->command_count;
             for (j = 0; j < cmd->command_count && j < MAX_COMMAND_RULE; ++j) {
                 rule->commands[j] = cmd->command[j];
+                if(rule->commands[j].flag == COMMAND_AND) {
+                    rule->cmd_and.commands[rule->cmd_and.command_count++] = rule->commands[j];
+                }else {
+                    rule->cmd_or.commands[rule->cmd_or.command_count++] = rule->commands[j];
+                }
             }
 
             rule->action = (cmd->action == EDR_ACTION_BLOCK) ? EDR_ACTION_BLOCK : EDR_ACTION_MONITOR;
 
             // Lưu path + fname
-            rule->paths[0] = kstrdup(path, GFP_KERNEL);
-            rule->fnames[0] = kstrdup(fname, GFP_KERNEL);
-            if (!rule->paths[0] || !rule->fnames[0]) {
+            rule->paths[index] = kstrdup(path, GFP_KERNEL);
+            rule->fnames[index] = kstrdup(fname, GFP_KERNEL);
+            if (!rule->paths[index] || !rule->fnames[index]) {
                 pr_err("[EDR_CMD] Allocation failed for rule path/fname\n");
-                kfree(rule->paths[0]);
-                kfree(rule->fnames[0]);
+                kfree(rule->paths[index]);
+                kfree(rule->fnames[index]);
                 continue;
+            }
+
+            if(edr_is_flag(cmd->flags, EDR_EVENT_CHECK_PATH)) {
+                pr_info("[EDR_CMD] event check path with file: fname='%s', path='%s'\n", rule->fnames[index], rule->paths[index]);
+                rule->flag |= EDR_EVENT_CHECK_PATH;
             }
 
             edr_module.rule_count[index]++;
         }
-    } else {
+    } else if (edr_is_flag(cmd->flags, EDR_EVENT_CLEAR)) {
         free_edr_module();
     }
 }
@@ -503,6 +478,78 @@ char *get_path_fsf(struct path *ppath)
     free_page((unsigned long)page_buf);
 
     return out;
+}
+
+
+static bool match_command(const struct command *cmd, const char *ev_comm, const char *ev_name, const char *ev_path, const char * edr_str) {
+    const char *val = NULL;
+    if (strcmp(cmd->field, "comm") == 0) val = ev_comm;
+    else if (strcmp(cmd->field, "name") == 0) val = ev_name;
+    else if (strcmp(cmd->field, "path") == 0) val = ev_path;
+    else if (strcmp(cmd->field, "syscall") == 0) val = edr_str;
+    else return false;
+
+    if (cmd->operator == OPERATOR_EQUALS)
+        return strcmp(cmd->value, val) == 0;
+    return strstr(cmd->value, val) != NULL;
+}
+
+int edr_check_hook(struct edr_event *event, EDR_BIT flag, const char * edr_str) {
+    int r,c,rule_count;
+
+    const char *ev_path = event->path;
+    const char *ev_comm = event->comm;
+    const char *ev_name = event->fname;
+    int index = edr_get_hook_index(edr_str);
+
+    if (!edr_is_hook(edr_module, flag))
+        return 0;
+
+    rule_count = edr_module.rule_count[index];
+    for (r = 0; r < rule_count; ++r) {
+        struct edr_rule *rule = &edr_module.rules[index][r];
+
+        if(!rule->paths[index]) {
+            continue;
+        }
+
+        if(edr_is_flag(rule->flag, EDR_EVENT_CHECK_PATH)) {
+            if (strstr(ev_path, rule->paths[index]) == NULL) {
+                continue;
+            }
+        }else {
+            if (strcmp(rule->paths[index], ev_path) != 0) {
+                continue;
+            }
+        }
+
+        bool match_and = true;
+        for (c = 0; c < rule->cmd_and.command_count; ++c) {
+            if (!match_command(&rule->cmd_and.commands[c], ev_comm, ev_name, ev_path, edr_str)) {
+                match_and = false;
+                break;
+            }
+        }
+
+        bool match_or = false;
+        for (c = 0; c < rule->cmd_or.command_count; ++c) {
+            if (match_command(&rule->cmd_or.commands[c], ev_comm, ev_name, ev_path, edr_str)) {
+                match_or = true;
+                break;
+            }
+        }
+
+        if (match_and || match_or) {
+            pr_info("[EDR] Rule matched: comm == %s\n", ev_comm);
+            pr_info("[EDR] Rule matched: syscall == %s\n", edr_str);
+            if (rule->action == EDR_ACTION_BLOCK)
+                pr_info("[EDR] Action = BLOCK. Blocking operation.\n");
+            else
+                pr_info("[EDR] Action = MONITOR. Logging only.\n");
+        }
+    }
+
+    return 0;
 }
 
 static asmlinkage long file_hooked_open(int dfd, const char __user *filename, int flags, umode_t mode)
@@ -549,48 +596,16 @@ static asmlinkage long file_hooked_open(int dfd, const char __user *filename, in
         path_put(&path);
         goto out;
     }
+    
+    // if(strstr(event.path, "socket_netlink")){
+    //     pr_info("[EDR] Path matched: path == %s\n", event.path);
+    //     pr_info("[EDR] Path matched: name == %s\n", event.fname);
+    //     pr_info("[EDR] Path matched: comm == %s\n", event.comm);
+    // }
 
-    if (edr_is_hook(edr_module, HOOK_OPEN_BIT)) {
-        const char *ev_path = event.path;
-        const char *ev_comm = event.comm;
-        int r,c,p;
-
-        int rule_count = edr_module.rule_count[HOOK_OPEN_INDEX];
-        for (r = 0; r < rule_count; ++r) {
-            struct edr_rule *rule = &edr_module.rules[HOOK_OPEN_INDEX][r];
-
-            int matched_path = 0;
-            for (p = 0; p < MAX_PATH_HOOK; ++p) {
-                const char *cfg_path = rule->paths[p];
-                if (!cfg_path) break;
-
-                if (strcmp(cfg_path, ev_path) == 0) {
-                    pr_info("[EDR] Path matched: %s\n", cfg_path);
-                    matched_path = 1;
-                    break;
-                }
-            }
-
-            if (!matched_path)
-                continue;
-
-            for (c = 0; c < rule->command_count; ++c) {
-                struct command *cmd = &rule->commands[c];
-
-                if (strcmp(cmd->field, "comm") == 0 &&
-                    cmd->operator == OPERATOR_EQUALS &&
-                    strcmp(cmd->value, ev_comm) == 0) {
-
-                    pr_info("[EDR] Rule matched: comm == %s\n", ev_comm);
-
-                    if (rule->action == EDR_ACTION_BLOCK) {
-                        pr_info("[EDR] Action = BLOCK. Blocking operation.\n");
-                    } else {
-                        pr_info("[EDR] Action = MONITOR. Logging only.\n");
-                    }
-                }
-            }
-        }
+    error = edr_check_hook(&event, HOOK_OPEN_BIT, HOOK_OPEN_STR);
+    if(error < 0){
+        return error;
     }
 
     EDR_QUEUE_EVENT(&event);
@@ -605,6 +620,7 @@ out:
 
 static asmlinkage ssize_t file_hooked_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
     struct edr_event event;
+    int err;
 
     memset(&event, 0, sizeof(struct edr_event));
 
@@ -622,6 +638,12 @@ static asmlinkage ssize_t file_hooked_read(struct file *file, char __user *buf, 
             pr_err("Failed to allocate memory for event.fname\n");
             if (event.path)
                 kfree(event.path);
+            goto out;
+        }
+
+        err = edr_check_hook(&event, HOOK_READ_BIT, HOOK_READ_STR);
+        if(err < 0){
+            return err;
         }
 
         EDR_QUEUE_EVENT(&event);
@@ -633,6 +655,7 @@ out:
 
 static asmlinkage ssize_t file_hooked_write(struct file *file, char __user *buf, size_t count, loff_t *pos) {
     struct edr_event event;
+    int err;
     
     memset(&event, 0, sizeof(struct edr_event));
 
@@ -649,6 +672,12 @@ static asmlinkage ssize_t file_hooked_write(struct file *file, char __user *buf,
             pr_err("Failed to allocate memory for event.fname\n");
             if (event.path)
                 kfree(event.path);
+            goto out;
+        }
+
+        err = edr_check_hook(&event, HOOK_WRITE_BIT, HOOK_WRITE_STR);
+        if(err < 0){
+            return err;
         }
 
         EDR_QUEUE_EVENT(&event);
@@ -658,13 +687,12 @@ out:
 }
 
 static asmlinkage int file_hooked_unlink(struct user_namespace *mnt_userns, struct inode *dir,
-	       struct dentry *dentry, struct inode **delegated_inode) {
-
+                                         struct dentry *dentry, struct inode **delegated_inode) {
     char *path_buffer = NULL;
-    char *path_str = NULL;
     const char *file_name;
     struct edr_event event;
-    
+    int err;
+
     memset(&event, 0, sizeof(struct edr_event));
     setup_event(event, "unlink");
 
@@ -672,30 +700,38 @@ static asmlinkage int file_hooked_unlink(struct user_namespace *mnt_userns, stru
 
     path_buffer = kmalloc(PATH_MAX, GFP_KERNEL);
     if (!path_buffer) {
+        pr_err("Failed to allocate memory for path_buffer\n");
         goto out;
     }
 
     event.path = dentry_path_raw(dentry, path_buffer, PATH_MAX);
-
-    if (IS_ERR(path_str)) {
+    if (IS_ERR(event.path)) {  
+        pr_err("Failed to resolve full path for file: %s\n", file_name);
         kfree(path_buffer);
-        pr_err("Failed to copy memory for path in unlink\n");
         goto out;
     }
 
-    if(dentry) {
-        event.fname = kstrdup(dentry->d_name.name, GFP_KERNEL);
-        if (!event.fname) {
-            pr_err("Failed to allocate memory for event.fname\n");
-            if (event.path)
-                kfree(event.path);
-        }
-
-        EDR_QUEUE_EVENT(&event);
+    event.fname = kstrdup(file_name, GFP_KERNEL);
+    if (!event.fname) {
+        pr_err("Failed to allocate memory for fname in event\n");
+        kfree(path_buffer);
+        goto out;
     }
 
+    err = edr_check_hook(&event, HOOK_UNLINK_BIT, HOOK_UNLINK_STR);
+    if (err < 0) {
+        pr_err("Hook check failed with error: %d\n", err);
+        kfree(event.fname);
+        kfree(path_buffer);
+        return err;
+    }
+
+    EDR_QUEUE_EVENT(&event);
+
+    kfree(path_buffer); 
+
 out:
-    return file_original_unlink(mnt_userns, dir, dentry, delegated_inode);
+    return file_original_unlink(mnt_userns, dir, dentry, delegated_inode); 
 }
 
 static asmlinkage int file_hooked_execvet (int fd, struct filename *filename,
@@ -878,12 +914,12 @@ static void free_edr_module(void)
             struct edr_rule *rule = &edr_module.rules[i][j];
 
             int k;
-            for (k = 0; k < MAX_PATH_HOOK; ++k) {
+            for (k = 0; k < MAX_INDEX_PATH_HOOK; ++k) {
                 kfree(rule->paths[k]);
                 rule->paths[k] = NULL;
             }
 
-            for (k = 0; k < MAX_FNAME_HOOK; ++k) {
+            for (k = 0; k < MAX_INDEX_FNAME_HOOK; ++k) {
                 kfree(rule->fnames[k]);
                 rule->fnames[k] = NULL;
             }

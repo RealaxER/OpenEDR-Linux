@@ -22,6 +22,7 @@
         "sock.h": "c",
         "kthread.h": "c",
         "wait.h": "c",
-        "list.h": "c"
+        "list.h": "c",
+        "string.h": "c"
     }
 }
