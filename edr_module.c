@@ -41,33 +41,34 @@ struct ftrace_hook {
 };
 
 typedef __u32 EDR_BIT;
-#define MAX_COMMAND_INDEX 32
 
-#define MAX_INDEX_PATH_HOOK 32
-#define MAX_INDEX_FNAME_HOOK 32
+#define MAX_INDEX_HOOKS 32
+#define MAX_INDEX_RULE MAX_INDEX_HOOKS
+#define MAX_INDEX_PATH_HOOK MAX_INDEX_HOOKS
+#define MAX_INDEX_FNAME_HOOK MAX_INDEX_HOOKS
 
 struct command_group {
-    struct command commands[MAX_COMMAND_RULE];
+    struct command *commands; 
     int command_count;
 };
 
 struct edr_rule {
-    struct command commands[MAX_COMMAND_RULE];
+    struct command *commands; 
+    uint8_t command_count;
+
     struct command_group cmd_or;
     struct command_group cmd_and;
 
-    uint8_t command_count;
+    char *paths[MAX_INDEX_RULE];   
+    char *fnames[MAX_INDEX_RULE];  
 
-    char *paths[MAX_INDEX_PATH_HOOK];   
-    char *fnames[MAX_INDEX_FNAME_HOOK]; 
-
-    enum edr_action action;       
-    uint8_t flag; 
+    enum edr_action action;
+    uint8_t flag;
 };
 
 struct edr_system {
-    struct edr_rule rules[MAX_COMMAND_INDEX][MAX_COMMAND_RULE]; 
-    uint8_t rule_count[MAX_COMMAND_INDEX];                     
+    struct edr_rule *rules[MAX_INDEX_RULE];     
+    uint8_t rule_count[MAX_INDEX_RULE];
 
     EDR_BIT hooked;
 };
@@ -383,71 +384,130 @@ static int edr_worker_thread_rb(void *data)
 
 static void netlink_recv(struct sk_buff *skb)
 {
-    struct nlmsghdr *nlh = nlmsg_hdr(skb);
-    void *data = nlmsg_data(nlh);
-    int i, j, index;
+    struct nlmsghdr *nlh;
+    struct edr_event_cmd *cmd;
+    struct edr_rule *rule, *new_rules_ptr;
+    const char *fname, *path;
+    void *data;
+    int i, j, index, rule_idx;
+    int and_count, or_count;
 
-    struct edr_event_cmd *cmd = (struct edr_event_cmd *)data;
+    nlh = nlmsg_hdr(skb);
+    data = nlmsg_data(nlh);
+    cmd = (struct edr_event_cmd *)data;
 
     if (edr_is_flag(cmd->flags, EDR_EVENT_SET)) {
-        const char *fname = (char *)cmd + cmd->fname_offset;
-        const char *path  = (char *)cmd + cmd->path_offset;
-        int rule_idx; 
-        struct edr_rule *rule;
+        fname = (char *)cmd + cmd->fname_offset;
+        path  = (char *)cmd + cmd->path_offset;
 
-        pr_info("[EDR_CMD] Received rule ID: %s\n", cmd->id);
+        pr_info("[EDR_CMD] Received SET command for rule ID: %s\n", cmd->id);
         pr_info("[EDR_CMD] Target file: fname='%s', path='%s'\n", fname, path);
 
         for (i = 0; i < cmd->hooked_count; ++i) {
-            if (cmd->hooked[i][0] == '\0') continue;
-
-            pr_info("[EDR_CMD] Hooked action[%d]: %s\n", i, cmd->hooked[i]);
-
-            index = edr_get_hook_index(cmd->hooked[i]);
-            if (index < 0 || index >= MAX_COMMAND_INDEX) continue;
-
-            // Enable hook flag
-            edr_module.hooked |= (1ULL << index);
-
-            rule_idx = edr_module.rule_count[index];
-            if (rule_idx >= MAX_COMMAND_RULE) {
-                pr_warn("[EDR_CMD] Exceeded MAX_COMMAND_RULE for hook index %d\n", index);
+            if (cmd->hooked[i][0] == '\0') {
                 continue;
             }
+
+            index = edr_get_hook_index(cmd->hooked[i]);
+            if (index < 0 || index >= MAX_INDEX_RULE) {
+                pr_warn("[EDR_CMD] Invalid hook name: %s\n", cmd->hooked[i]);
+                continue;
+            }
+            
+            pr_info("[EDR_CMD] Processing hook[%d]: %s (index: %d)\n", i, cmd->hooked[i], index);
+
+            rule_idx = edr_module.rule_count[index];
+
+            new_rules_ptr = krealloc(
+                edr_module.rules[index],
+                sizeof(struct edr_rule) * (rule_idx + 1),
+                GFP_KERNEL
+            );
+
+            if (!new_rules_ptr) {
+                pr_err("[EDR_CMD] Failed to reallocate memory for rules array (index: %d)\n", index);
+                continue; 
+            }
+            edr_module.rules[index] = new_rules_ptr;
 
             rule = &edr_module.rules[index][rule_idx];
             memset(rule, 0, sizeof(struct edr_rule));
             
+
+            and_count = 0;
+            or_count = 0;
+            for (j = 0; j < cmd->command_count; ++j) {
+                if (cmd->command[j].flag == COMMAND_AND) {
+                    and_count++;
+                } else {
+                    or_count++;
+                }
+            }
+            
+            if (and_count > 0) {
+                rule->cmd_and.commands = kmalloc(and_count * sizeof(struct command), GFP_KERNEL);
+                if (!rule->cmd_and.commands) {
+                    pr_err("[EDR_CMD] Failed to allocate memory for AND commands\n");
+                    goto cleanup_rule; 
+                }
+            }
+            if (or_count > 0) {
+                rule->cmd_or.commands = kmalloc(or_count * sizeof(struct command), GFP_KERNEL);
+                if (!rule->cmd_or.commands) {
+                    pr_err("[EDR_CMD] Failed to allocate memory for OR commands\n");
+                    goto cleanup_rule; 
+                }
+            }
+            
             rule->command_count = cmd->command_count;
-            for (j = 0; j < cmd->command_count && j < MAX_COMMAND_RULE; ++j) {
-                rule->commands[j] = cmd->command[j];
-                if(rule->commands[j].flag == COMMAND_AND) {
-                    rule->cmd_and.commands[rule->cmd_and.command_count++] = rule->commands[j];
-                }else {
-                    rule->cmd_or.commands[rule->cmd_or.command_count++] = rule->commands[j];
+            rule->cmd_and.command_count = 0;
+            rule->cmd_or.command_count = 0;
+            for (j = 0; j < cmd->command_count; ++j) {
+                if (cmd->command[j].flag == COMMAND_AND) {
+                    rule->cmd_and.commands[rule->cmd_and.command_count++] = cmd->command[j];
+                } else {
+                    rule->cmd_or.commands[rule->cmd_or.command_count++] = cmd->command[j];
                 }
             }
 
-            rule->action = (cmd->action == EDR_ACTION_BLOCK) ? EDR_ACTION_BLOCK : EDR_ACTION_MONITOR;
-
-            // Lưu path + fname
             rule->paths[index] = kstrdup(path, GFP_KERNEL);
             rule->fnames[index] = kstrdup(fname, GFP_KERNEL);
             if (!rule->paths[index] || !rule->fnames[index]) {
-                pr_err("[EDR_CMD] Allocation failed for rule path/fname\n");
-                kfree(rule->paths[index]);
-                kfree(rule->fnames[index]);
-                continue;
+                pr_err("[EDR_CMD] Failed to duplicate path/fname strings\n");
+                goto cleanup_rule; 
             }
 
-            if(edr_is_flag(cmd->flags, EDR_EVENT_CHECK_PATH)) {
-                pr_info("[EDR_CMD] event check path with file: fname='%s', path='%s'\n", rule->fnames[index], rule->paths[index]);
+            rule->action = (cmd->action == EDR_ACTION_BLOCK) ? EDR_ACTION_BLOCK : EDR_ACTION_MONITOR;
+            
+            if (edr_is_flag(cmd->flags, EDR_EVENT_CHECK_PATH)) {
                 rule->flag |= EDR_EVENT_CHECK_PATH;
             }
 
+            edr_module.hooked |= (1ULL << index);
             edr_module.rule_count[index]++;
+                        
+            continue; 
+
+        cleanup_rule:
+            pr_err("[EDR_CMD] Cleaning up failed rule for hook index %d\n", index);
+            if (rule->cmd_and.commands)
+                kfree(rule->cmd_and.commands);
+
+            if (rule->cmd_or.commands)
+                kfree(rule->cmd_or.commands);
+
+            if (rule->paths && rule->paths[index])
+                kfree(rule->paths[index]);
+
+            if (rule->fnames && rule->fnames[index])
+                kfree(rule->fnames[index]);
+
+            memset(rule, 0, sizeof(struct edr_rule));
         }
-    } else if (edr_is_flag(cmd->flags, EDR_EVENT_CLEAR)) {
+    } 
+    /* --- Xử lý lệnh CLEAR (xóa tất cả rules) --- */
+    else if (edr_is_flag(cmd->flags, EDR_EVENT_CLEAR)) {
+        pr_info("[EDR_CMD] Received CLEAR command. Freeing all rules.\n");
         free_edr_module();
     }
 }
@@ -494,36 +554,49 @@ static bool match_command(const struct command *cmd, const char *ev_comm, const 
     return strstr(cmd->value, val) != NULL;
 }
 
-int edr_check_hook(struct edr_event *event, EDR_BIT flag, const char * edr_str) {
-    int r,c,rule_count;
+int edr_check_hook(struct edr_event *event, EDR_BIT flag, const char *edr_str)
+{
+    int r, c;
+    int rule_count;
+    int index;
+    const char *ev_path;
+    const char *ev_comm;
+    const char *ev_name;
+    struct edr_rule *rule;
+    bool match_and;
+    bool match_or;
 
-    const char *ev_path = event->path;
-    const char *ev_comm = event->comm;
-    const char *ev_name = event->fname;
-    int index = edr_get_hook_index(edr_str);
+    if (!event || !edr_str)
+        return 0;
 
-    if (!edr_is_hook(edr_module, flag))
+    ev_path = event->path ? event->path : "";
+    ev_comm = event->comm ? event->comm : "";
+    ev_name = event->fname ? event->fname : "";
+
+    index = edr_get_hook_index(edr_str);
+    if (index < 0 || !edr_is_hook(edr_module, flag))
         return 0;
 
     rule_count = edr_module.rule_count[index];
+
     for (r = 0; r < rule_count; ++r) {
-        struct edr_rule *rule = &edr_module.rules[index][r];
+        rule = &edr_module.rules[index][r];
 
-        if(!rule->paths[index]) {
+        /* check path */
+        if (!rule->paths || !rule->paths[index])
             continue;
+
+        /* check EDR_EVENT_CHECK_PATH */
+        if (edr_is_flag(rule->flag, EDR_EVENT_CHECK_PATH)) {
+            if (!strstr(ev_path, rule->paths[index]))
+                continue;
+        } else {
+            if (strcmp(ev_path, rule->paths[index]) != 0)
+                continue;
         }
 
-        if(edr_is_flag(rule->flag, EDR_EVENT_CHECK_PATH)) {
-            if (strstr(ev_path, rule->paths[index]) == NULL) {
-                continue;
-            }
-        }else {
-            if (strcmp(rule->paths[index], ev_path) != 0) {
-                continue;
-            }
-        }
-
-        bool match_and = true;
+        /* check AND command */
+        match_and = true;
         for (c = 0; c < rule->cmd_and.command_count; ++c) {
             if (!match_command(&rule->cmd_and.commands[c], ev_comm, ev_name, ev_path, edr_str)) {
                 match_and = false;
@@ -531,7 +604,8 @@ int edr_check_hook(struct edr_event *event, EDR_BIT flag, const char * edr_str) 
             }
         }
 
-        bool match_or = false;
+        /* check OR command */
+        match_or = false;
         for (c = 0; c < rule->cmd_or.command_count; ++c) {
             if (match_command(&rule->cmd_or.commands[c], ev_comm, ev_name, ev_path, edr_str)) {
                 match_or = true;
@@ -540,12 +614,12 @@ int edr_check_hook(struct edr_event *event, EDR_BIT flag, const char * edr_str) 
         }
 
         if (match_and || match_or) {
-            pr_info("[EDR] Rule matched: comm == %s\n", ev_comm);
-            pr_info("[EDR] Rule matched: syscall == %s\n", edr_str);
-            if (rule->action == EDR_ACTION_BLOCK)
+            pr_info("[EDR] Rule matched: comm = %s, syscall = %s\n", ev_comm, edr_str);
+            if (rule->action == EDR_ACTION_BLOCK) {
                 pr_info("[EDR] Action = BLOCK. Blocking operation.\n");
-            else
+            } else {
                 pr_info("[EDR] Action = MONITOR. Logging only.\n");
+            }
         }
     }
 
@@ -907,25 +981,58 @@ cleanup:
 
 static void free_edr_module(void)
 {
-    size_t i, j;
+    size_t i, j, k;
+    struct edr_rule *rule;
 
-    for (i = 0; i < MAX_COMMAND_INDEX; ++i) {
+    for (i = 0; i < MAX_INDEX_RULE; ++i) {
+        if (!edr_module.rules[i])
+            continue;
+
         for (j = 0; j < edr_module.rule_count[i]; ++j) {
-            struct edr_rule *rule = &edr_module.rules[i][j];
+            rule = &edr_module.rules[i][j];
 
-            int k;
-            for (k = 0; k < MAX_INDEX_PATH_HOOK; ++k) {
-                kfree(rule->paths[k]);
-                rule->paths[k] = NULL;
+            /* Free all paths */
+            if (rule->paths) {
+                for (k = 0; k < MAX_INDEX_PATH_HOOK; ++k) {
+                    kfree(rule->paths[k]);
+                    rule->paths[k] = NULL;
+                }
             }
 
-            for (k = 0; k < MAX_INDEX_FNAME_HOOK; ++k) {
-                kfree(rule->fnames[k]);
-                rule->fnames[k] = NULL;
+            /* Free all fnames */
+            if (rule->fnames) {
+                for (k = 0; k < MAX_INDEX_FNAME_HOOK; ++k) {
+                    kfree(rule->fnames[k]);
+                    rule->fnames[k] = NULL;
+                }
             }
 
+            /* Free command groups */
+            if (rule->commands) {
+                kfree(rule->commands);
+                rule->commands = NULL;
+            }
+
+            if (rule->cmd_and.commands) {
+                kfree(rule->cmd_and.commands);
+                rule->cmd_and.commands = NULL;
+            }
+
+            if (rule->cmd_or.commands) {
+                kfree(rule->cmd_or.commands);
+                rule->cmd_or.commands = NULL;
+            }
+
+            /* Reset counters and flags */
             rule->command_count = 0;
+            rule->cmd_and.command_count = 0;
+            rule->cmd_or.command_count = 0;
+            rule->flag = 0;
         }
+
+        /* Free rule array */
+        kfree(edr_module.rules[i]);
+        edr_module.rules[i] = NULL;
         edr_module.rule_count[i] = 0;
     }
 

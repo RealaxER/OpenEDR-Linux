@@ -20,13 +20,6 @@ int sock_fd;
 struct sockaddr_nl dest_addr;
 FILE *log_file = NULL;
 
-
-#define MAX_RULES 100
-#define MAX_HOOKS 10
-#define MAX_TAGS 10
-#define MAX_STRING_LEN 256
-#define MAX_LONG_STRING_LEN 1024
-
 typedef struct {
     char name[MAX_STRING_LEN];
     char id[TASK_COMM_LEN];
@@ -36,8 +29,8 @@ typedef struct {
     char fname[MAX_STRING_LEN];
     char action[TASK_COMM_LEN];
     char priority[TASK_COMM_LEN];
-    char output[1024];
-    char condition[MAX_LONG_STRING_LEN];
+    char output[MAX_STRING_LEN];
+    char condition[MAX_STRING_LEN];
     
     char hooked[MAX_HOOKS][TASK_COMM_LEN];
     int hooked_count;
@@ -46,16 +39,38 @@ typedef struct {
     int tags_count;
 } edr_rule_t;
 
+typedef struct {
+    char condition[MAX_STRING_LEN];
+    char name[TASK_COMM_LEN];
+} edr_macro_t;
+
+typedef struct {
+    char comm[TASK_COMM_LEN][TASK_COMM_LEN];
+    char name[TASK_COMM_LEN];
+    int item_count;
+} edr_list_t;
+
 edr_rule_t rules[MAX_RULES];
+edr_macro_t macros[MAX_MACRO];
+edr_list_t lists[MAX_LIST];
+
 int rule_count = 0;
+int macro_count = 0;
+int list_count = 0;
+uint8_t parse_flag = 0;
 
 char current_key[128] = {0};
 int expect_value = 0;
 int parsing_hooked_array = 0;
 int parsing_tags_array = 0;
+int parsing_items_array = 0;
+
+unsigned long long flag = 0;
 
 void process_scalar(yaml_token_t token) {
     edr_rule_t *current_rule = &rules[rule_count];
+    edr_macro_t *current_macro = &macros[macro_count];
+    edr_list_t *current_list = &lists[list_count];
 
     if (parsing_hooked_array) {
         if (current_rule->hooked_count < MAX_HOOKS) {
@@ -70,31 +85,82 @@ void process_scalar(yaml_token_t token) {
         return;
     }
 
+    if(parsing_items_array) {
+        if (current_list->item_count < MAX_ITEMS) {
+            strncpy(current_list->comm[current_list->item_count++], (char*)token.data.scalar.value, TASK_COMM_LEN - 1);
+        }
+        return;
+    }
+
     if (!expect_value) { 
         strncpy(current_key, (char *)token.data.scalar.value, sizeof(current_key) - 1);
     } else {
-        if (strcmp(current_key, "rule") == 0) strncpy(current_rule->name, (char*)token.data.scalar.value, sizeof(current_rule->name) - 1);
-        else if (strcmp(current_key, "id") == 0) strncpy(current_rule->id, (char*)token.data.scalar.value, sizeof(current_rule->id) - 1);
-        else if (strcmp(current_key, "des") == 0) strncpy(current_rule->description, (char*)token.data.scalar.value, sizeof(current_rule->description) - 1);
-        else if (strcmp(current_key, "path") == 0) strncpy(current_rule->path, (char*)token.data.scalar.value, sizeof(current_rule->path) - 1);
-        else if (strcmp(current_key, "fname") == 0) strncpy(current_rule->fname, (char*)token.data.scalar.value, sizeof(current_rule->fname) - 1);
-        else if (strcmp(current_key, "action") == 0) strncpy(current_rule->action, (char*)token.data.scalar.value, sizeof(current_rule->action) - 1);
-        else if (strcmp(current_key, "priority") == 0) strncpy(current_rule->priority, (char*)token.data.scalar.value, sizeof(current_rule->priority) - 1);
-        else if (strcmp(current_key, "output") == 0) strncpy(current_rule->output, (char*)token.data.scalar.value, sizeof(current_rule->output) - 1);
-        else if (strcmp(current_key, "condition") == 0) strncpy(current_rule->condition, (char*)token.data.scalar.value, sizeof(current_rule->condition) - 1);
+        if (strcmp(current_key, "rule") == 0) {
+            if (rules[rule_count].name[0] != '\0') {
+                if (rule_count < MAX_RULES - 1) {
+                    rule_count++;
+                }
+            }
+            memset(&rules[rule_count], 0, sizeof(edr_rule_t));
+            rules[rule_count].hooked_count = 0;
+            rules[rule_count].tags_count = 0;
+            parse_flag = FLAG_RULE;
+
+            strncpy(current_rule->name, (char*)token.data.scalar.value, sizeof(current_rule->name) - 1);
+        } else if (strcmp(current_key, "id") == 0) {
+            strncpy(current_rule->id, (char*)token.data.scalar.value, sizeof(current_rule->id) - 1);
+        } else if (strcmp(current_key, "des") == 0) {
+            strncpy(current_rule->description, (char*)token.data.scalar.value, sizeof(current_rule->description) - 1);
+        } else if (strcmp(current_key, "path") == 0) {
+            strncpy(current_rule->path, (char*)token.data.scalar.value, sizeof(current_rule->path) - 1);
+        } else if (strcmp(current_key, "fname") == 0) {
+            strncpy(current_rule->fname, (char*)token.data.scalar.value, sizeof(current_rule->fname) - 1);
+        } else if (strcmp(current_key, "action") == 0) {
+            strncpy(current_rule->action, (char*)token.data.scalar.value, sizeof(current_rule->action) - 1);
+        } else if (strcmp(current_key, "priority") == 0) {
+            strncpy(current_rule->priority, (char*)token.data.scalar.value, sizeof(current_rule->priority) - 1);
+        } else if (strcmp(current_key, "output") == 0) {
+            strncpy(current_rule->output, (char*)token.data.scalar.value, sizeof(current_rule->output) - 1);
+        } else if (strcmp(current_key, "condition") == 0) {
+            if (parse_flag & FLAG_MACRO) {
+                strncpy(current_macro->condition, (char*)token.data.scalar.value, sizeof(current_macro->condition) - 1);
+            } else if (parse_flag & FLAG_RULE) {
+                strncpy(current_rule->condition, (char*)token.data.scalar.value, sizeof(current_rule->condition) - 1);
+            }
+        } else if (strcmp(current_key, "macro") == 0) {
+            if (macros[macro_count].name[0] != '\0') {
+                if (macro_count < MAX_MACRO - 1) {
+                    macro_count++;
+                }
+            }
+            parse_flag = FLAG_MACRO;
+            memset(&macros[macro_count], 0, sizeof(edr_macro_t));
+            strncpy(current_macro->name, (char*)token.data.scalar.value, sizeof(current_macro->name) - 1);
+        }
+
+        else if (strcmp(current_key, "list") == 0) {
+            if (lists[list_count].name[0] != '\0') {
+                if (list_count < MAX_LIST - 1) {
+                    list_count++;
+                }
+            }
+            parse_flag = FLAG_LIST;
+            memset(&lists[list_count], 0, sizeof(edr_list_t));
+            strncpy(current_list->name, (char*)token.data.scalar.value, sizeof(current_list->name) - 1);
+        }
     }
 }
 
 int parse_conditions(const char *input_str, struct command *cmds, int max_cmds) {
-    char buffer[1024];
+    char buffer[MAX_STRING_LEN];
     strncpy(buffer, input_str, sizeof(buffer) - 1);
     buffer[sizeof(buffer) - 1] = '\0';
 
-    char *tokens[256];
+    char *tokens[MAX_STRING_LEN];
     int token_count = 0;
 
     char *token = strtok(buffer, " ");
-    while (token && token_count < 256) {
+    while (token && token_count < MAX_STRING_LEN) {
         tokens[token_count++] = token;
         token = strtok(NULL, " ");
     }
@@ -306,6 +372,114 @@ void remove_asterisk(char *path) {
     }
 }
 
+bool contains_macro(const char *condition, edr_macro_t macros, char *found_macro) {
+    char pattern[TASK_COMM_LEN + 3]; 
+    snprintf(pattern, sizeof(pattern), "(%s)", macros.name);
+    if (strstr(condition, pattern)) {
+        if (found_macro) strncpy(found_macro, macros.name, TASK_COMM_LEN);
+        return true;
+    }
+    return false;
+}
+
+bool expand_macro(char *condition, edr_macro_t macros) {
+    char expanded[MAX_STRING_LEN * 2] = {0};
+    char *macro_start, *macro_end;
+    char pattern[TASK_COMM_LEN + 3];
+    snprintf(pattern, sizeof(pattern), "(%s)", macros.name);
+
+    macro_start = strstr(condition, pattern);
+    if (macro_start) {
+        int prefix_len = macro_start - condition;
+        strncpy(expanded, condition, prefix_len);
+        expanded[prefix_len] = '\0';
+
+        strncat(expanded, macros.condition, MAX_STRING_LEN);
+
+        macro_end = macro_start + strlen(pattern);
+        strncat(expanded, macro_end, MAX_STRING_LEN);
+
+        strncpy(condition, expanded, MAX_STRING_LEN);
+        return true;
+    }
+
+    return false;
+}
+
+
+// void expand_list_names(char *condition, size_t buf_len, struct list *lists, int total_list)
+// {
+//     std::string cond_str = condition;
+//     size_t pos = 0;
+
+//     while ((pos = cond_str.find("{", pos)) != std::string::npos) {
+//         size_t end = cond_str.find("}", pos);
+//         if (end == std::string::npos) break;
+
+//         std::string list_name = cond_str.substr(pos + 1, end - pos - 1);
+//         std::string key_expr = cond_str.substr(0, pos);
+//         std::string key;
+
+//         // Tìm phần tử list theo tên
+//         struct list *matched_list = NULL;
+//         for (int i = 0; i < total_list; ++i) {
+//             if (strcmp(lists[i].name, list_name.c_str()) == 0) {
+//                 matched_list = &lists[i];
+//                 break;
+//             }
+//         }
+
+//         if (!matched_list) {
+//             pos = end + 1;
+//             continue;
+//         }
+
+//         // Lấy key như "comm in" hoặc "name in"
+//         size_t key_start = key_expr.rfind("name");
+//         if (key_start == std::string::npos)
+//             key_start = key_expr.rfind("comm");
+//         if (key_start == std::string::npos)
+//             break;
+
+//         key = key_expr.substr(key_start);
+//         key.erase(key.find_last_not_of(" \t") + 1); // Trim trailing spaces
+
+//         std::string expanded;
+
+//         if (key.find("==") != std::string::npos) {
+//             // comm == {shells} -> comm == sh (chỉ lấy phần tử đầu)
+//             expanded = key.substr(0, key.find("==") + 2) + " " + matched_list->comm[0];
+//         } else if (key.find("in") != std::string::npos) {
+//             // comm in {shells} -> comm in sh or comm in bash ...
+//             for (int i = 0; i < matched_list->item_count; ++i) {
+//                 if (i != 0)
+//                     expanded += " or ";
+//                 expanded += key.substr(0, key.find("in") + 2) + " " + matched_list->comm[i];
+//             }
+//         }
+
+//         // Thay thế đoạn "{shells}" trong chuỗi gốc
+//         cond_str.replace(key_start, end - key_start + 1, expanded);
+//         pos = key_start + expanded.length();
+//     }
+
+//     // Copy kết quả cuối cùng về lại condition
+//     strncpy(condition, cond_str.c_str(), buf_len - 1);
+//     condition[buf_len - 1] = '\0';
+// }
+
+
+void expand_all_macros(char *condition, edr_macro_t *macros, size_t macros_size) {
+    char found_macro[TASK_COMM_LEN];
+
+
+    for(int i= 0; i < macros_size; i++ ){
+        if (contains_macro(condition, macros[i], found_macro)) {
+            expand_macro(condition, macros[i]);
+        }
+    }
+}
+
 int main() {
     FILE *fh = fopen("config.yaml", "r");
     if (!fh) {
@@ -331,13 +505,6 @@ int main() {
             break;
 
         case YAML_BLOCK_ENTRY_TOKEN: 
-            if (rules[rule_count].name[0] != '\0') { 
-                 if(rule_count < MAX_RULES -1) {
-                    rule_count++;
-                 }
-            }
-            rules[rule_count].hooked_count = 0;
-            rules[rule_count].tags_count = 0;
             break;
 
         case YAML_KEY_TOKEN:
@@ -354,11 +521,13 @@ int main() {
         case YAML_FLOW_SEQUENCE_START_TOKEN: 
             if (strcmp(current_key, "hooked") == 0) parsing_hooked_array = 1;
             else if (strcmp(current_key, "tags") == 0) parsing_tags_array = 1;
+            else if (strcmp(current_key, "items") == 0) parsing_items_array = 1;
             break;
         
         case YAML_FLOW_SEQUENCE_END_TOKEN:
             parsing_hooked_array = 0;
             parsing_tags_array = 0;
+            parsing_items_array = 0;
             break;
 
         default:
@@ -373,6 +542,19 @@ int main() {
 
     int total_rules = rule_count + 1;
     if (rules[0].name[0] == '\0') total_rules = 0; 
+
+    int total_macro = macro_count +1;
+    if (macros[0].name[0] == '\0') total_macro = 0; 
+
+    int total_list = list_count +1;
+    if (lists[0].name[0] == '\0') total_list = 0; 
+
+    if(total_list > 0){
+        printf("total_list: %d\n", total_list);
+        printf("name: %s\n", lists[0].name);
+        printf("com: %s\n", lists[0].comm[0]);
+        printf("com: %s\n", lists[0].comm[1]);
+    }
 
     struct sockaddr_nl src_addr = {0};
     char buffer[MAX_PAYLOAD + NLMSG_HDRLEN];
@@ -418,6 +600,13 @@ int main() {
         }else {
             event.action = EDR_ACTION_MONITOR;
         }
+
+        printf("before rules[i].condition: %s\n", rules[i].condition);
+
+        //expand_list_names(rules[i].condition, strlen(rules[i].condition), lists, total_list);        
+        expand_all_macros(rules[i].condition, macros, total_macro);
+
+        printf("after rules[i].condition: %s\n", rules[i].condition);
 
         int command_count = parse_conditions(rules[i].condition, cmds, MAX_COMMAND_RULE);
 

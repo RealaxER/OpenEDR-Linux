@@ -80,16 +80,25 @@ struct edr_event_hdr {
 #define OPERATOR_EQUALS 0
 #define OPERATOR_IN     1
 
+#define FLAG_NONE   0
+#define FLAG_RULE   (1ULL << 0)
+#define FLAG_MACRO  (1ULL << 1)
+#define FLAG_LIST  (1ULL << 2)
+
+
 #define MAX_FIELD_SIZE  64
 #define MAX_VALUE_SIZE  64
 #define MAX_COMMAND_RULE 10
 
-struct command {
-    int flag;                 // AND / OR / NONE
-    int operator;             // == / in
-    char field[MAX_FIELD_SIZE]; 
-    char value[MAX_VALUE_SIZE]; 
-};
+#define MAX_RULES 100
+#define MAX_MACRO 100
+#define MAX_LIST 100
+
+#define MAX_HOOKS 10
+#define MAX_TAGS MAX_HOOKS
+#define MAX_ITEMS MAX_HOOKS
+
+#define MAX_STRING_LEN 256
 
 #define EDR_EVENT_SET (1ULL << 0)
 #define EDR_EVENT_CLEAR (1ULL << 1)
@@ -100,8 +109,15 @@ enum edr_action {
     EDR_ACTION_BLOCK   = 1
 };
 
+struct command {
+    int flag;                 // AND / OR / NONE
+    int operator;             // == / in
+    char field[MAX_FIELD_SIZE]; 
+    char value[MAX_VALUE_SIZE]; 
+};
+
 struct edr_event_cmd {
-    int flags;
+    __u8 flags;
     char id[TASK_COMM_LEN];  
     __u16 fname_offset;              
     __u16 path_offset;         
